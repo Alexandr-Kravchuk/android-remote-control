@@ -2,7 +2,14 @@
 // End-to-end check of the relay protocol with a fake phone and a fake helper.
 const assert = require('assert');
 const { WebSocket } = require('ws');
-const { server } = require('../server');
+const { server, expandIPv6 } = require('../server');
+
+// IPv6 normalisation used for per-/64 rate limiting.
+assert.deepStrictEqual(expandIPv6('2001:db8::1').slice(0, 4), ['2001', '0db8', '0000', '0000']);
+assert.deepStrictEqual(expandIPv6('2001:0db8:0:0::1'), expandIPv6('2001:db8::1'));
+assert.strictEqual(expandIPv6('::ffff:1.2.3.4').join(':'), '0000:0000:0000:0000:0000:ffff:0102:0304');
+assert.strictEqual(expandIPv6('1::2::3'), null);
+assert.strictEqual(expandIPv6('zz::1'), null);
 
 function open(url) {
   return new Promise((res, rej) => {

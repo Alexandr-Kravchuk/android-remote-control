@@ -110,8 +110,33 @@ function serveStatic(req, res) {
   });
 }
 
-function makeHttpHandler({ console: withConsole }) {
+const LOCAL_HOSTS = (port) => new Set([`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`]);
+
+/** Laptop console must be addressed as localhost — blocks DNS-rebinding attacks. */
+function isLocalHost(req) {
+  return LOCAL_HOSTS(CONSOLE_PORT).has(String(req.headers.host || '').toLowerCase());
+}
+
+/**
+ * Browsers always send Origin on WebSocket upgrades. A page from another site
+ * (open in the helper's browser) must not be able to talk to /ws/viewer.
+ * Non-browser clients send no Origin; CSWSH doesn't apply to them.
+ */
+function originAllowed(req, localOnly) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  let host;
+  try { host = new URL(origin).host.toLowerCase(); } catch { return false; }
+  if (localOnly) return LOCAL_HOSTS(CONSOLE_PORT).has(host) && isLocalHost(req);
+  return host === String(req.headers.host || '').toLowerCase();
+}
+
+function makeHttpHandler({ console: withConsole, localOnly = false }) {
   return (req, res) => {
+    if (localOnly && !isLocalHost(req)) {
+      res.writeHead(403, { 'content-type': 'text/plain' }).end('Open the console via http://localhost');
+      return;
+    }
     const pathname = (req.url || '/').split('?')[0];
     if (pathname === '/healthz') {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -134,10 +159,34 @@ function clientIp(req) {
     const parts = String(req.headers['x-forwarded-for']).split(',').map((s) => s.trim()).filter(Boolean);
     if (parts.length) ip = parts[parts.length - 1];
   }
-  ip = ip.replace(/^::ffff:/, '');
+  ip = ip.replace(/^::ffff:(?=\d+\.)/i, '');
   // Group IPv6 addresses by /64 — one client usually owns the whole prefix.
-  if (ip.includes(':')) ip = ip.split(':').slice(0, 4).join(':') + '::/64';
+  if (ip.includes(':')) {
+    const full = expandIPv6(ip);
+    ip = full ? full.slice(0, 4).join(':') + '::/64' : 'invalid-ipv6';
+  }
   return ip;
+}
+
+/** '2001:db8::1' → ['2001','0db8','0000',…,'0001'] (8 groups), or null if malformed. */
+function expandIPv6(addr) {
+  let a = addr.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
+  // Embedded IPv4 tail (::ffff:1.2.3.4) → two hex groups.
+  const v4 = a.match(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const b = v4.slice(1).map(Number);
+    if (b.some((x) => x > 255)) return null;
+    a = a.slice(0, -v4[0].length) + ((b[0] << 8) | b[1]).toString(16) + ':' + ((b[2] << 8) | b[3]).toString(16);
+  }
+  const halves = a.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail];
+  if (!groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => g.padStart(4, '0'));
 }
 
 function send(ws, obj) {
@@ -168,13 +217,9 @@ function failures(key) {
   return e.count;
 }
 
-function isRateLimited(ip) {
-  return failures(ip) >= JOIN_FAIL_LIMIT_IP || failures('*') >= JOIN_FAIL_LIMIT_GLOBAL;
-}
-
-function recordJoinFailure(ip) {
+function recordJoinFailure(ip, { global = false } = {}) {
   const now = Date.now();
-  for (const key of [ip, '*']) {
+  for (const key of global ? [ip, '*'] : [ip]) {
     const e = joinFailures.get(key);
     if (!e || now > e.resetAt) joinFailures.set(key, { count: 1, resetAt: now + JOIN_FAIL_WINDOW_MS });
     else e.count++;
@@ -299,18 +344,21 @@ function handleViewer(ws, ip) {
     const msg = parse(data, isBinary);
     if (!msg || msg.type !== 'join') return;
 
-    if (isRateLimited(ip)) {
+    const limited = () =>
       send(ws, { type: 'error', error: 'rate-limited', message: 'Забагато невдалих спроб. Спробуйте пізніше.' });
-      return;
-    }
+    if (failures(ip) >= JOIN_FAIL_LIMIT_IP) return limited();
     if (ACCESS_TOKEN && !safeEqual(msg.token || '', ACCESS_TOKEN)) {
+      // Wrong token: counted per IP only, so strangers can't lock out the real helper.
       recordJoinFailure(ip);
       send(ws, { type: 'error', error: 'bad-token', message: 'Невірний ключ доступу.' });
       return;
     }
+    // Past this point the client is trusted (valid token, or local console in laptop mode).
+    // The global limit still caps code guessing if a token ever leaks.
+    if (failures('*') >= JOIN_FAIL_LIMIT_GLOBAL) return limited();
     const s = sessions.get(String(msg.code || '').replace(/\D/g, ''));
     if (!s) {
-      recordJoinFailure(ip);
+      recordJoinFailure(ip, { global: true });
       send(ws, { type: 'error', error: 'bad-code', message: 'Сесію з таким кодом не знайдено.' });
       return;
     }
@@ -341,11 +389,11 @@ function handleViewer(ws, ip) {
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 
-function attachUpgrade(server, { device, viewer }) {
+function attachUpgrade(server, { device, viewer, localOnly = false }) {
   server.on('upgrade', (req, socket, head) => {
     const pathname = (req.url || '/').split('?')[0];
     const isDevice = pathname === '/ws/device' && device;
-    const isViewer = pathname === '/ws/viewer' && viewer;
+    const isViewer = pathname === '/ws/viewer' && viewer && originAllowed(req, localOnly);
     if (!isDevice && !isViewer) {
       socket.destroy();
       return;
@@ -377,8 +425,8 @@ const server = http.createServer(makeHttpHandler({ console: !CONSOLE_PORT }));
 attachUpgrade(server, { device: true, viewer: !CONSOLE_PORT });
 
 // Local-only console server (laptop mode).
-const consoleServer = CONSOLE_PORT ? http.createServer(makeHttpHandler({ console: true })) : null;
-if (consoleServer) attachUpgrade(consoleServer, { device: true, viewer: true });
+const consoleServer = CONSOLE_PORT ? http.createServer(makeHttpHandler({ console: true, localOnly: true })) : null;
+if (consoleServer) attachUpgrade(consoleServer, { device: true, viewer: true, localOnly: true });
 
 if (require.main === module) {
   if (!CONSOLE_PORT && !ACCESS_TOKEN && !ALLOW_INSECURE) {
@@ -399,4 +447,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { server, consoleServer, sessions };
+module.exports = { server, consoleServer, sessions, expandIPv6 };

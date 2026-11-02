@@ -16,12 +16,12 @@ function run(env) {
   return p;
 }
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const get = (port, p) => new Promise((res, rej) =>
-  http.get({ host: '127.0.0.1', port, path: p }, (r) => {
+const get = (port, p, host) => new Promise((res, rej) =>
+  http.get({ host: '127.0.0.1', port, path: p, headers: host ? { host } : {} }, (r) => {
     let b = ''; r.on('data', (d) => (b += d)); r.on('end', () => res({ status: r.statusCode, body: b }));
   }).on('error', rej));
-const wsOpens = (url) => new Promise((res) => {
-  const ws = new WebSocket(url);
+const wsOpens = (url, origin) => new Promise((res) => {
+  const ws = new WebSocket(url, origin ? { origin } : {});
   ws.on('open', () => { ws.close(); res(true); });
   ws.on('error', () => res(false));
 });
@@ -46,6 +46,10 @@ const wsOpens = (url) => new Promise((res) => {
     const local = await get(18092, '/');
     assert.ok(local.body.includes('<html'), 'console served locally');
     assert.strictEqual((await get(18092, '/%E0%A4%A')).status, 400);
+    // Another website open in the helper's browser must not reach the console.
+    assert.strictEqual(await wsOpens('ws://127.0.0.1:18092/ws/viewer', 'https://evil.example'), false, 'foreign Origin rejected');
+    assert.strictEqual(await wsOpens('ws://localhost:18092/ws/viewer', 'http://localhost:18092'), true, 'own Origin accepted');
+    assert.strictEqual((await get(18092, '/', 'evil.example:18092')).status, 403, 'DNS rebinding blocked');
     assert.match(lap.out, /localhost:18092/);
   } finally {
     lap.kill();
