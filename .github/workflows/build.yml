@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      # Set the repository variable REMOTE_HELP_SERVER (Settings → Secrets and variables →
+      # Actions → Variables) to your server address, e.g. https://help.example.com
+      # Optional: a stable signing key, so updates install over the old version.
+      # Secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD (see README).
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        if: env.KEYSTORE_BASE64 != ''
+        run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+      - name: Build APK
+        env:
+          RH_KEYSTORE_FILE: ${{ runner.temp }}/release.jks
+          RH_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          RH_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          RH_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleRelease lintDebug -PremoteHelpServer="${{ vars.REMOTE_HELP_SERVER || 'https://CHANGE-ME.example.com' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-help-apk
+          path: android/app/build/outputs/apk/release/*.apk

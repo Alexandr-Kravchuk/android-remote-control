@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0D1117</color>
+    <color name="text">#E6EDF3</color>
+    <color name="muted">#8B98A8</color>
+    <color name="warn_bg">#3A2F0B</color>
+    <color name="go">#238636</color>
+    <color name="stop">#DA3633</color>
+</resources>

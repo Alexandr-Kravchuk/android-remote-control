@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Допомога</string>
+    <string name="a11y_label">Допомога — керування</string>
+    <string name="a11y_description">Дозволяє вашому помічнику натискати на екран, гортати і вводити текст під час сесії допомоги. Працює лише тоді, коли ви самі натиснули «Отримати допомогу» і продиктували код.</string>
+
+    <string name="btn_get_help">ОТРИМАТИ\nДОПОМОГУ</string>
+    <string name="btn_stop">ЗУПИНИТИ</string>
+    <string name="idle_hint">Натисніть велику кнопку, коли вам потрібна допомога з телефоном</string>
+    <string name="connecting">Підключення…</string>
+    <string name="your_code">Ваш код:</string>
+    <string name="tell_code">Продиктуйте цей код помічнику</string>
+    <string name="helper_connected">Помічник бачить ваш екран і допомагає</string>
+    <string name="reconnecting">Немає інтернету. Перепідключення…</string>
+
+    <string name="a11y_off_title">Керування вимкнено</string>
+    <string name="a11y_off_text">Помічник зможе лише дивитися на екран. Щоб він міг натискати, увімкніть «Допомога — керування» у Спеціальних можливостях.</string>
+    <string name="a11y_open">Відкрити налаштування</string>
+    <string name="a11y_restricted_hint">Якщо перемикач неактивний: Налаштування → Програми → Допомога → ⋮ (вгорі праворуч) → «Дозволити обмежені налаштування».</string>
+
+    <string name="settings">Налаштування</string>
+    <string name="server_url">Адреса сервера</string>
+    <string name="save">Зберегти</string>
+    <string name="cancel">Скасувати</string>
+    <string name="server_not_set">Адресу сервера не налаштовано. Натисніть ⚙ і введіть її.</string>
+
+    <string name="notif_channel">Сесія допомоги</string>
+    <string name="notif_title_waiting">Очікування помічника · код %1$s</string>
+    <string name="notif_title_connected">Помічник підключений</string>
+    <string name="notif_text">Натисніть «Зупинити», щоб завершити</string>
+    <string name="notif_stop">Зупинити</string>
+    <string name="toast_helper_joined">Помічник підключився</string>
+    <string name="toast_helper_left">Помічник відключився</string>
+    <string name="toast_stopped">Допомогу завершено</string>
+    <string name="msg_from_helper">Повідомлення від помічника</string>
+    <string name="ok">Зрозуміло</string>
+
+    <string name="toast_call_started">Помічник розпочав розмову — говоріть</string>
+    <string name="notif_title_call">Розмова з помічником</string>
+    <string name="mic_mute">Вимкнути мікрофон</string>
+    <string name="mic_unmute">Увімкнути мікрофон</string>
+    <string name="call_connecting">📞 З’єднуємо розмову…</string>
+    <string name="call_active">📞 Розмова йде — говоріть, вас чути</string>
+    <string name="call_active_muted">📞 Розмова йде — ваш мікрофон вимкнено</string>
+    <string name="call_reconnecting">📞 Поганий зв’язок, відновлюємо розмову…</string>
+    <string name="call_failed">📞 Розмову не вдалося з’єднати. Помічник може подзвонити вам звичайним дзвінком.</string>
+    <string name="mic_denied">Без доступу до мікрофона розмова в додатку не працюватиме, але помічник може вам подзвонити.</string>
+</resources>

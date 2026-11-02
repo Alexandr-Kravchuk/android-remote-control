@@ -1,0 +1,27 @@
+# VPS setup (if your laptop isn't always on). On a laptop use mac/start.sh instead.
+# Production setup on any VPS with a domain pointing to it.
+#   DOMAIN=help.example.com ACCESS_TOKEN=some-long-secret docker compose up -d
+# Caddy obtains a free HTTPS certificate automatically.
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    environment:
+      - ACCESS_TOKEN=${ACCESS_TOKEN:?set ACCESS_TOKEN=<long random string>}
+      - TRUST_PROXY=1
+      - TURN_URLS=${TURN_URLS:-}
+      - TURN_USERNAME=${TURN_USERNAME:-}
+      - TURN_CREDENTIAL=${TURN_CREDENTIAL:-}
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:?set DOMAIN=your.domain}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+volumes:
+  caddy_data:
