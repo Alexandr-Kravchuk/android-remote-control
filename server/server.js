@@ -44,6 +44,9 @@ const DEVICE_GRACE_MS = 3 * 60 * 1000;      // keep the session while the phone 
 const JOIN_FAIL_LIMIT_IP = 20;               // failed joins per IP (or IPv6 /64) ...
 const JOIN_FAIL_LIMIT_GLOBAL = 200;          // ... and in total ...
 const JOIN_FAIL_WINDOW_MS = 10 * 60 * 1000;  // ... per 10 minutes
+const TOKEN_FAIL_SLOWDOWN = 100;             // wrong tokens in total → answer slowly (tarpit)
+const TOKEN_SLOW_MS = 2000;
+const MIN_TOKEN_LENGTH = 16;
 const MAX_VIEWER_BUFFER = 4 * 1024 * 1024;
 const HEARTBEAT_MS = 30 * 1000;              // generous: mobile links stall for a while
 
@@ -348,9 +351,14 @@ function handleViewer(ws, ip) {
       send(ws, { type: 'error', error: 'rate-limited', message: 'Забагато невдалих спроб. Спробуйте пізніше.' });
     if (failures(ip) >= JOIN_FAIL_LIMIT_IP) return limited();
     if (ACCESS_TOKEN && !safeEqual(msg.token || '', ACCESS_TOKEN)) {
-      // Wrong token: counted per IP only, so strangers can't lock out the real helper.
+      // Wrong token: blocked per IP. Globally we only *slow down* (never block),
+      // so a distributed attack crawls while the real helper can still get in.
+      // The token itself is ≥16 chars, so guessing it is infeasible anyway.
       recordJoinFailure(ip);
-      send(ws, { type: 'error', error: 'bad-token', message: 'Невірний ключ доступу.' });
+      recordJoinFailure('*token');
+      const reply = () => send(ws, { type: 'error', error: 'bad-token', message: 'Невірний ключ доступу.' });
+      if (failures('*token') >= TOKEN_FAIL_SLOWDOWN) setTimeout(reply, TOKEN_SLOW_MS);
+      else reply();
       return;
     }
     // Past this point the client is trusted (valid token, or local console in laptop mode).
@@ -429,6 +437,11 @@ const consoleServer = CONSOLE_PORT ? http.createServer(makeHttpHandler({ console
 if (consoleServer) attachUpgrade(consoleServer, { device: true, viewer: true, localOnly: true });
 
 if (require.main === module) {
+  if (ACCESS_TOKEN && ACCESS_TOKEN.length < MIN_TOKEN_LENGTH) {
+    console.error(`Refusing to start: ACCESS_TOKEN must be at least ${MIN_TOKEN_LENGTH} characters ` +
+      '(e.g. openssl rand -hex 16).');
+    process.exit(1);
+  }
   if (!CONSOLE_PORT && !ACCESS_TOKEN && !ALLOW_INSECURE) {
     console.error(
       'Refusing to start: the helper console is public but ACCESS_TOKEN is not set.\n' +

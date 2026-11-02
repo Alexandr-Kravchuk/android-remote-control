@@ -33,6 +33,11 @@ const wsOpens = (url, origin) => new Promise((res) => {
   assert.strictEqual(code, 1, 'must refuse to start without ACCESS_TOKEN');
   assert.match(bad.out, /ACCESS_TOKEN/);
 
+  // A short token is refused (too easy to guess).
+  const weak = run({ PORT: '18093', CONSOLE_PORT: '', ACCESS_TOKEN: 'short', ALLOW_INSECURE: '' });
+  assert.strictEqual(await new Promise((r) => weak.on('exit', r)), 1, 'must refuse a short ACCESS_TOKEN');
+  assert.match(weak.out, /at least 16/);
+
   // Laptop mode: console only on localhost:CONSOLE_PORT; public port = phones only.
   const lap = run({ PORT: '18091', CONSOLE_PORT: '18092', ACCESS_TOKEN: '' });
   await wait(500);
