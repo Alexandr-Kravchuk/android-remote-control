@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Віддалена допомога</title>
+  <meta name="theme-color" content="#1f6feb">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- ======================= JOIN ======================= -->
+  <main id="join" class="join">
+    <div class="card">
+      <img src="icon.svg" alt="" class="logo">
+      <h1>Віддалена допомога</h1>
+      <p class="muted">Попросіть людину відкрити на телефоні додаток <b>«Допомога»</b>,
+        натиснути велику кнопку і продиктувати вам код.</p>
+      <form id="joinForm" autocomplete="off">
+        <label for="code">Код з телефону</label>
+        <input id="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="7" placeholder="000 000" required autofocus>
+        <details id="tokenBox">
+          <summary>Ключ доступу до сервера</summary>
+          <input id="token" type="password" placeholder="лише якщо на сервері задано ACCESS_TOKEN">
+        </details>
+        <button type="submit" class="primary" id="joinBtn">Підключитися</button>
+        <p id="joinError" class="error" role="alert"></p>
+      </form>
+    </div>
+  </main>
+
+  <!-- ======================= SESSION ======================= -->
+  <main id="session" class="session" hidden>
+    <header class="topbar">
+      <div class="who">
+        <span id="statusDot" class="dot"></span>
+        <b id="deviceName">Телефон</b>
+        <span id="deviceInfo" class="muted"></span>
+      </div>
+      <div class="stats muted" id="stats"></div>
+      <div class="actions">
+        <button id="disconnectBtn" title="Відключитися (сесія на телефоні залишиться)">Відключитися</button>
+        <button id="endBtn" class="danger" title="Зупинити трансляцію на телефоні">Завершити сесію</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <section class="screen-wrap">
+        <div id="screenBox" class="screen-box" aria-label="Екран телефону. Клік — дотик, перетягування — свайп, утримання — довге натискання, коліщатко — прокрутка.">
+          <canvas id="screen"></canvas>
+          <textarea id="kbd" class="kbd" aria-label="Ввід з клавіатури на телефон" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+          <div id="overlay" class="overlay">Очікування зображення…</div>
+        </div>
+        <nav class="navbar">
+          <button data-action="back" title="Назад (Esc)">◁<span>Назад</span></button>
+          <button data-action="home" title="Додому">○<span>Додому</span></button>
+          <button data-action="recents" title="Останні програми">▢<span>Програми</span></button>
+        </nav>
+      </section>
+
+      <aside class="panel">
+        <h2>Керування</h2>
+        <div class="grid">
+          <button data-action="notifications">🔔 Сповіщення</button>
+          <button data-action="quick_settings">⚙️ Швидкі налаштування</button>
+          <button data-action="power_dialog">⏻ Меню живлення</button>
+          <button data-action="lock_screen">🔒 Заблокувати</button>
+          <button data-action="screenshot">📸 Скріншот на телефоні</button>
+          <button id="saveShotBtn">💾 Зберегти кадр</button>
+        </div>
+
+        <h2>Текст</h2>
+        <p class="hint muted">Тапніть у потрібне поле на телефоні, потім введіть текст тут.
+          Або клікніть на екран і просто друкуйте.</p>
+        <form id="textForm" class="row">
+          <input id="textInput" placeholder="Текст для поля вводу">
+          <button type="submit">Ввести</button>
+        </form>
+        <div class="row">
+          <button data-key="backspace">⌫ Стерти</button>
+          <button data-key="enter">↵ Enter</button>
+          <button data-key="clear">✕ Очистити поле</button>
+        </div>
+
+        <h2>Повідомлення на телефон</h2>
+        <form id="msgForm" class="row">
+          <input id="msgInput" placeholder="Напр.: Не натискай нічого, я налаштовую">
+          <button type="submit">Показати</button>
+        </form>
+
+        <h2>Якість</h2>
+        <div class="row">
+          <select id="quality">
+            <option value="low">Низька (повільний інтернет)</option>
+            <option value="medium" selected>Середня</option>
+            <option value="high">Висока</option>
+          </select>
+        </div>
+
+        <details class="help">
+          <summary>Підказки</summary>
+          <ul>
+            <li><b>Клік</b> — дотик</li>
+            <li><b>Перетягування</b> — свайп</li>
+            <li><b>Утримання</b> (0,6 с) — довге натискання</li>
+            <li><b>Коліщатко / тачпад</b> — прокрутка</li>
+            <li><b>Esc</b> — «Назад», друк на клавіатурі — текст у поле</li>
+          </ul>
+        </details>
+      </aside>
+    </div>
+    <div id="toast" class="toast" hidden></div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

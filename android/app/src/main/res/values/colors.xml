@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="accent">#1F6FEB</color>
+    <color name="go">#1A7F37</color>
+    <color name="stop">#CF222E</color>
+    <color name="bg">#F4F6F9</color>
+    <color name="text">#1B1F24</color>
+    <color name="muted">#5F6B7A</color>
+    <color name="warn_bg">#FFF4D6</color>
+</resources>
