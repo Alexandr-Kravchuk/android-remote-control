@@ -39,6 +39,7 @@
         <b id="deviceName">Телефон</b>
         <span id="deviceInfo" class="muted"></span>
       </div>
+      <div class="link" id="link" title="Якість зв’язку з телефоном"><span class="bars"><i></i><i></i><i></i></span><span id="linkText">—</span></div>
       <div class="stats muted" id="stats"></div>
       <div class="actions">
         <button id="disconnectBtn" title="Відключитися (сесія на телефоні залишиться)">Відключитися</button>
@@ -61,6 +62,14 @@
       </section>
 
       <aside class="panel">
+        <h2>Розмова</h2>
+        <div class="call">
+          <button id="callBtn" class="primary">📞 Почати розмову</button>
+          <button id="micBtn" hidden>🎤 Вимкнути мій мікрофон</button>
+          <p id="callStatus" class="hint muted">Голос іде напряму між вами і телефоном, поряд із керуванням.</p>
+        </div>
+        <audio id="remoteAudio" autoplay playsinline></audio>
+
         <h2>Керування</h2>
         <div class="grid">
           <button data-action="notifications">🔔 Сповіщення</button>
@@ -93,9 +102,9 @@
         <h2>Якість</h2>
         <div class="row">
           <select id="quality">
-            <option value="low">Низька (повільний інтернет)</option>
-            <option value="medium" selected>Середня</option>
-            <option value="high">Висока</option>
+            <option value="auto" selected>Авто (підлаштовується під зв’язок)</option>
+            <option value="low">Економ (дуже слабкий інтернет)</option>
+            <option value="high">Висока (добрий Wi-Fi)</option>
           </select>
         </div>
 

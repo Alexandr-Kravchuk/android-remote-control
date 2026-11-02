@@ -16,6 +16,8 @@ android {
         versionCode = 1
         versionName = "1.0"
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"$serverUrl\"")
+        // WebRTC ships native libraries; real phones only need ARM.
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
     // Release signing: set RH_KEYSTORE_FILE, RH_KEYSTORE_PASSWORD, RH_KEY_ALIAS, RH_KEY_PASSWORD
@@ -59,4 +61,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // WebRTC (voice call with echo cancellation, jitter buffer, packet-loss concealment)
+    implementation("io.getstream:stream-webrtc-android:1.3.10")
 }

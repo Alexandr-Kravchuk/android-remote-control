@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke.js"
+    "laptop": "PORT=8080 CONSOLE_PORT=8081 node server.js",
+    "test": "node test/smoke.js && node test/modes.js"
   },
   "engines": { "node": ">=18" },
   "dependencies": {

@@ -18,8 +18,9 @@
   let code = '';
   let ended = false;          // session finished — don't reconnect
   let reconnectTimer = null;
-  let frames = 0, bytes = 0, lastFrameAt = 0;
+  let frames = 0, bytes = 0, lastFrameAt = 0, lastStatsAt = 0;
   let decoding = false, pendingFrame = null;
+  let iceServers = [];
 
   $('token').value = store.get('rh.token');
   if (store.get('rh.token')) $('tokenBox').open = true;
@@ -96,15 +97,48 @@
         $('deviceName').textContent = msg.name || 'Телефон';
         document.title = `${msg.name || 'Телефон'} — Віддалена допомога`;
         setStatus(msg.online ? 'ok' : 'bad', msg.online ? 'Очікування зображення…' : 'Телефон не в мережі. Очікуємо…');
+        if (Array.isArray(msg.iceServers)) iceServers = msg.iceServers;
+        resetDecoder(false);
         sendQuality();
+        sendCaps();
         focusScreen();
+        // We were in a call and our own connection dropped — the phone ended it; call again.
+        if (callWanted) { closePc(); startCall(); }
         break;
       case 'device-online':
         setStatus('ok', 'Телефон знову на зв’язку');
+        resetDecoder(false);
         sendQuality();
+        sendCaps();
         break;
       case 'device-offline':
-        setStatus('bad', 'Телефон втратив зв’язок. Очікуємо…');
+        setStatus('bad', 'Слабкий зв’язок: телефон тимчасово недоступний. Чекаємо…');
+        setLink('poor', 'Телефон не на зв’язку');
+        break;
+      case 'stats':
+        onStats(msg);
+        break;
+      case 'stream':
+        streamMode = msg.mode;
+        break;
+      case 'rtc-answer':
+        onAnswer(msg.sdp);
+        break;
+      case 'rtc-ice':
+        onRemoteIce(msg);
+        break;
+      case 'call-state':
+        onPhoneCallState(msg);
+        break;
+      case 'call-unavailable':
+        callWanted = false;
+        closePc();
+        setCall('idle', msg.reason === 'no-permission'
+          ? 'На телефоні не дозволено мікрофон. Подзвоніть звичайним дзвінком або дозвольте мікрофон для «Допомога».'
+          : 'Розмова недоступна на цьому телефоні. Подзвоніть звичайним дзвінком.');
+        break;
+      case 'voice-available':
+        if (!msg.available) $('callStatus').textContent = 'На телефоні не дозволено мікрофон — розмова в додатку не працюватиме.';
         break;
       case 'session-ended':
         leave({
@@ -136,6 +170,8 @@
 
   function leave(reason) {
     ended = true;
+    endCall(false);
+    resetDecoder(false);
     clearTimeout(reconnectTimer);
     if (ws) { ws.onclose = null; ws.close(); ws = null; }
     sessionView.hidden = true;
@@ -154,45 +190,307 @@
   }
 
   // ------------------------------------------------------------ frames
+  //
+  // Binary message from the phone: [kind:1][id:4][payload]
+  //   kind 1 = H.264 key frame (Annex B, with SPS/PPS), 2 = H.264 delta, 3 = JPEG.
+  // Every frame is acked with its id: the phone measures round-trip time from that and
+  // adapts bitrate, and stops sending when too much is in flight (bad connection).
 
-  function onFrame(buf) {
-    frames++;
-    bytes += buf.byteLength;
-    // Tell the phone we received it, so it can send the next one (flow control).
-    send({ type: 'ack' });
-    if (decoding) { pendingFrame = buf; return; }
-    draw(buf);
+  let streamMode = '';
+  let decoder = null, decoderCodec = "", needKey = true, lastKeyReq = -Infinity, chunkTs = 0;
+  const h264Supported = (async () => {
+    try {
+      return 'VideoDecoder' in window &&
+        (await VideoDecoder.isConfigSupported({ codec: 'avc1.42E01F' })).supported === true;
+    } catch { return false; }
+  })();
+
+  async function sendCaps() {
+    send({ type: 'caps', h264: await h264Supported, jpeg: true });
   }
 
-  async function draw(buf) {
+  function onFrame(buf) {
+    if (buf.byteLength < 6) return;
+    frames++;
+    bytes += buf.byteLength;
+    const dv = new DataView(buf);
+    const kind = dv.getUint8(0);
+    const id = dv.getUint32(1);
+    send({ type: 'ack', id });
+    const data = new Uint8Array(buf, 5);
+    if (kind === 3) drawJpeg(data);
+    else if (kind === 1 || kind === 2) decodeH264(kind === 1, data);
+  }
+
+  function frameShown(w, h) {
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    lastFrameAt = Date.now();
+    if (!overlay.hidden && !$('statusDot').classList.contains('bad')) setStatus('ok', '');
+  }
+
+  // --- JPEG
+  function drawJpeg(data) {
+    if (decoding) { pendingFrame = data; return; }
+    drawJpegNow(data);
+  }
+  async function drawJpegNow(data) {
     decoding = true;
     try {
-      const bmp = await createImageBitmap(new Blob([buf], { type: 'image/jpeg' }));
-      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-        canvas.width = bmp.width;
-        canvas.height = bmp.height;
-      }
+      const bmp = await createImageBitmap(new Blob([data], { type: 'image/jpeg' }));
+      frameShown(bmp.width, bmp.height);
       ctx.drawImage(bmp, 0, 0);
       bmp.close();
-      lastFrameAt = Date.now();
-      if (!overlay.hidden) setStatus('ok', '');
     } catch { /* corrupt frame */ }
     decoding = false;
-    if (pendingFrame) {
-      const next = pendingFrame;
-      pendingFrame = null;
-      draw(next);
+    if (pendingFrame) { const n = pendingFrame; pendingFrame = null; drawJpegNow(n); }
+  }
+
+  // --- H.264 via WebCodecs
+  function codecFromAnnexB(d) {
+    for (let i = 0; i + 4 < d.length; i++) {
+      if (d[i] === 0 && d[i + 1] === 0 && d[i + 2] === 1) {
+        if ((d[i + 3] & 0x1f) === 7 && i + 6 < d.length) {
+          const hex = (v) => v.toString(16).padStart(2, '0');
+          return 'avc1.' + hex(d[i + 4]) + hex(d[i + 5]) + hex(d[i + 6]);
+        }
+        i += 2;
+      }
     }
+    return null;
+  }
+
+  function setupDecoder(codec) {
+    try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch { /* ignore */ }
+    decoder = new VideoDecoder({
+      output: (f) => {
+        frameShown(f.displayWidth, f.displayHeight);
+        ctx.drawImage(f, 0, 0, f.displayWidth, f.displayHeight);
+        f.close();
+      },
+      error: (e) => { console.warn('decoder', e); resetDecoder(true); },
+    });
+    decoder.configure({ codec, optimizeForLatency: true });
+    decoderCodec = codec;
+  }
+
+  function resetDecoder(askKey) {
+    try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch { /* ignore */ }
+    decoder = null;
+    decoderCodec = '';
+    needKey = true;
+    if (askKey) requestKey();
+  }
+
+  function requestKey() {
+    const now = performance.now();
+    if (now - lastKeyReq < 1000) return;
+    lastKeyReq = now;
+    send({ type: 'keyframe' });
+  }
+
+  function decodeH264(isKey, data) {
+    if (isKey) {
+      const c = codecFromAnnexB(data) || 'avc1.42E01F';
+      if (!decoder || decoder.state === 'closed' || c !== decoderCodec) {
+        try { setupDecoder(c); } catch (e) { console.warn(e); resetDecoder(true); return; }
+      }
+      needKey = false;
+    }
+    if (!decoder || needKey) { requestKey(); return; }
+    if (decoder.decodeQueueSize > 8) { needKey = true; requestKey(); return; } // can't keep up
+    try {
+      decoder.decode(new EncodedVideoChunk({ type: isKey ? 'key' : 'delta', timestamp: (chunkTs++) * 33333, data }));
+    } catch (e) {
+      console.warn(e);
+      resetDecoder(true);
+    }
+  }
+
+  // --- connection quality
+  function setLink(kind, text) {
+    $('link').className = 'link ' + kind;
+    $('linkText').textContent = text;
+  }
+
+  let lastStats = null;
+  function onStats(m) {
+    lastStatsAt = Date.now();
+    lastStats = m;
+    const rtt = m.rtt || 0;
+    if (m.drops > 2 || rtt > 1200) setLink('poor', `Поганий зв’язок · ${rtt} мс`);
+    else if (m.drops > 0 || rtt > 450) setLink('fair', `Середній зв’язок · ${rtt} мс`);
+    else setLink('good', `Добрий зв’язок${rtt ? ' · ' + rtt + ' мс' : ''}`);
   }
 
   setInterval(() => {
     if (sessionView.hidden) return;
-    const kb = (bytes / 1024).toFixed(0);
+    const kbps = Math.round((bytes * 8) / 1000);
     const idle = lastFrameAt ? Math.round((Date.now() - lastFrameAt) / 1000) : null;
-    $('stats').textContent = `${frames} кадр/с · ${kb} КБ/с` + (idle && idle > 5 ? ` · екран не змінювався ${idle} с` : '');
+    const fmt = streamMode === 'h264' ? 'H.264' : streamMode === 'jpeg' ? 'JPEG' : '';
+    $('stats').textContent = [`${frames} кадр/с`, `${kbps} кбіт/с`, fmt,
+      idle && idle > 5 ? `екран не змінювався ${idle} с` : ''].filter(Boolean).join(' · ');
+    if (lastStatsAt && Date.now() - lastStatsAt > 5000 && !$('statusDot').classList.contains('bad')) {
+      setLink('poor', 'Немає відповіді від телефону');
+    }
     frames = 0;
     bytes = 0;
   }, 1000);
+
+  // ------------------------------------------------------------ voice (WebRTC)
+  //
+  // The browser offers, the phone answers automatically. Audio goes peer-to-peer
+  // (or through TURN if configured); the server only relays the signalling.
+
+  let pc = null, localStream = null, callWanted = false, iceRestarts = 0, pendingIce = [];
+  let disconnectTimer = null;
+
+  function setCall(state, text) {
+    const btn = $('callBtn');
+    const inCall = state !== 'idle';
+    btn.textContent = inCall ? '📵 Завершити розмову' : '📞 Почати розмову';
+    btn.classList.toggle('active', inCall);
+    btn.classList.toggle('primary', !inCall);
+    $('micBtn').hidden = !inCall;
+    if (text != null) $('callStatus').textContent = text;
+  }
+
+  // Opus with in-band FEC + DTX at a modest bitrate survives packet loss much better.
+  function tuneOpus(sdp) {
+    const m = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
+    if (!m) return sdp;
+    const pt = m[1];
+    const re = new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`);
+    const extra = { useinbandfec: '1', usedtx: '1', maxaveragebitrate: '32000' };
+    if (!re.test(sdp)) return sdp;
+    return sdp.replace(re, (_, params) => {
+      const map = {};
+      params.split(';').map((x) => x.trim()).filter(Boolean).forEach((kv) => {
+        const [k, v = ''] = kv.split('='); map[k] = v;
+      });
+      Object.assign(map, extra);
+      return `a=fmtp:${pt} ` + Object.entries(map).map(([k, v]) => `${k}=${v}`).join(';');
+    });
+  }
+
+  async function startCall() {
+    callWanted = true;
+    iceRestarts = 0;
+    setCall('connecting', 'З’єднуємо розмову…');
+    try {
+      if (!localStream) {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      }
+    } catch {
+      callWanted = false;
+      setCall('idle', 'Браузер не дав доступу до мікрофона. Дозвольте мікрофон для цієї сторінки і спробуйте ще раз.');
+      return;
+    }
+    pc = new RTCPeerConnection({ iceServers });
+    pendingIce = [];
+    localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+    pc.ontrack = (e) => {
+      const audio = $('remoteAudio');
+      audio.srcObject = e.streams[0] || new MediaStream([e.track]);
+      audio.play().catch(() => {});
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        send({ type: 'rtc-ice', candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex });
+      }
+    };
+    const thisPc = pc;
+    pc.oniceconnectionstatechange = () => {
+      if (pc !== thisPc) return;
+      const st = pc.iceConnectionState;
+      clearTimeout(disconnectTimer);
+      if (st === 'connected' || st === 'completed') {
+        iceRestarts = 0;
+        setCall('active', 'Розмова йде. Голос передається напряму.');
+      } else if (st === 'disconnected') {
+        setCall('connecting', 'Зв’язок погіршився, відновлюємо розмову…');
+        disconnectTimer = setTimeout(() => { if (pc === thisPc && pc.iceConnectionState === 'disconnected') restartIce(); }, 4000);
+      } else if (st === 'failed') {
+        restartIce();
+      }
+    };
+    await makeOffer(false);
+  }
+
+  async function makeOffer(iceRestart) {
+    if (!pc) return;
+    const offer = await pc.createOffer({ iceRestart });
+    const tuned = { type: 'offer', sdp: tuneOpus(offer.sdp) };
+    await pc.setLocalDescription(tuned);
+    send({ type: 'rtc-offer', sdp: tuned.sdp });
+  }
+
+  function restartIce() {
+    if (!pc || !callWanted) return;
+    if (iceRestarts >= 3) {
+      setCall('connecting', 'Не вдається з’єднати голос напряму. Подзвоніть звичайним дзвінком' +
+        ' (або налаштуйте TURN на сервері — див. README). Керування працює як і раніше.');
+      return;
+    }
+    iceRestarts++;
+    setCall('connecting', `Відновлюємо розмову (спроба ${iceRestarts})…`);
+    makeOffer(true).catch((e) => console.warn(e));
+  }
+
+  async function onAnswer(sdp) {
+    if (!pc) return;
+    try {
+      await pc.setRemoteDescription({ type: 'answer', sdp });
+      for (const c of pendingIce) await pc.addIceCandidate(c).catch(() => {});
+      pendingIce = [];
+    } catch (e) { console.warn('answer', e); }
+  }
+
+  function onRemoteIce(m) {
+    if (!pc) return;
+    const c = { candidate: m.candidate, sdpMid: m.sdpMid, sdpMLineIndex: m.sdpMLineIndex };
+    if (!pc.remoteDescription) pendingIce.push(c);
+    else pc.addIceCandidate(c).catch(() => {});
+  }
+
+  function onPhoneCallState(m) {
+    if (!callWanted) return;
+    const note = m.muted ? ' На телефоні вимкнено мікрофон.' : '';
+    if (m.state === 'connected') setCall('active', 'Розмова йде. Голос передається напряму.' + note);
+    else if (m.state === 'ended') { closePc(); callWanted = false; setCall('idle', 'Розмову завершено на телефоні.'); }
+    else if (note) $('callStatus').textContent = $('callStatus').textContent.replace(/ На телефоні.*$/, '') + note;
+  }
+
+  function closePc() {
+    clearTimeout(disconnectTimer);
+    if (pc) { try { pc.close(); } catch { /* ignore */ } }
+    pc = null;
+    pendingIce = [];
+  }
+
+  function endCall(notifyPhone = true) {
+    if (notifyPhone && callWanted) send({ type: 'call-end' });
+    callWanted = false;
+    closePc();
+    if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+    $('micBtn').classList.remove('off');
+    $('micBtn').textContent = '🎤 Вимкнути мій мікрофон';
+    setCall('idle', 'Голос іде напряму між вами і телефоном, поряд із керуванням.');
+  }
+
+  $('callBtn').addEventListener('click', () => {
+    if (callWanted) endCall(true);
+    else startCall().catch((e) => { console.warn(e); endCall(true); });
+  });
+  $('micBtn').addEventListener('click', () => {
+    if (!localStream) return;
+    const track = localStream.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    $('micBtn').classList.toggle('off', !track.enabled);
+    $('micBtn').textContent = track.enabled ? '🎤 Вимкнути мій мікрофон' : '🔇 Мій мікрофон вимкнено';
+  });
 
   // ------------------------------------------------------------ input
 
@@ -354,7 +652,7 @@
   });
 
   function sendQuality() { send({ type: 'quality', level: $('quality').value }); }
-  $('quality').value = store.get('rh.quality') || 'medium';
+  $('quality').value = ['auto', 'low', 'high'].includes(store.get('rh.quality')) ? store.get('rh.quality') : 'auto';
   $('quality').addEventListener('change', () => { store.set('rh.quality', $('quality').value); sendQuality(); });
 
   $('saveShotBtn').addEventListener('click', () => {

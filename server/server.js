@@ -2,17 +2,30 @@
 /**
  * Remote Help relay server.
  *
- *  - Serves the web console (./public) for the helper.
- *  - /ws/device  : the Android phone connects here, gets a 6-digit session code.
+ *  - /ws/device  : the Android phone connects here and gets a 6-digit session code.
  *  - /ws/viewer  : the helper's browser connects here and joins by that code.
+ *  - static      : the helper's web console (./public).
  *
- * The server never stores or inspects screen frames — it only relays
- * messages between exactly one phone and one helper.
+ * Two ways to run it:
+ *
+ *  1. "Laptop" mode (CONSOLE_PORT set): the web console and /ws/viewer listen ONLY on
+ *     127.0.0.1:CONSOLE_PORT, so they are unreachable from the internet. The public
+ *     PORT (exposed through Tailscale Funnel / Cloudflare Tunnel) serves only /ws/device.
+ *
+ *  2. "VPS" mode (no CONSOLE_PORT): everything on PORT; ACCESS_TOKEN is then required.
+ *
+ * The server never stores or inspects screen frames or audio — it only relays
+ * messages between exactly one phone and one helper. Voice goes peer-to-peer
+ * (WebRTC); this server only forwards the signalling messages.
  *
  * Env:
- *   PORT          listen port (default 8080)
- *   ACCESS_TOKEN  optional; if set, the helper must enter it to join a session
- *   TRUST_PROXY   "1" to take client IP from X-Forwarded-For (behind nginx/Render/Fly)
+ *   PORT            public port (default 8080)
+ *   CONSOLE_PORT    enables laptop mode, e.g. 8081 → console at http://localhost:8081
+ *   ACCESS_TOKEN    helper must enter it to join (required in VPS mode)
+ *   ALLOW_INSECURE  "1" to run VPS mode without ACCESS_TOKEN (local testing only)
+ *   TRUST_PROXY     "1" to take client IP from X-Forwarded-For (behind nginx/Caddy)
+ *   STUN_URLS       comma-separated, default Google public STUN
+ *   TURN_URLS, TURN_USERNAME, TURN_CREDENTIAL   optional TURN relay for voice
  */
 const http = require('http');
 const fs = require('fs');
@@ -21,18 +34,37 @@ const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
+const CONSOLE_PORT = process.env.CONSOLE_PORT ? parseInt(process.env.CONSOLE_PORT, 10) : 0;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
+const ALLOW_INSECURE = process.env.ALLOW_INSECURE === '1';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-const DEVICE_GRACE_MS = 2 * 60 * 1000; // keep session while phone reconnects
-const JOIN_FAIL_LIMIT = 20;            // failed joins per IP ...
-const JOIN_FAIL_WINDOW_MS = 10 * 60 * 1000; // ... per 10 minutes
+const DEVICE_GRACE_MS = 3 * 60 * 1000;      // keep the session while the phone reconnects
+const JOIN_FAIL_LIMIT_IP = 20;               // failed joins per IP (or IPv6 /64) ...
+const JOIN_FAIL_LIMIT_GLOBAL = 200;          // ... and in total ...
+const JOIN_FAIL_WINDOW_MS = 10 * 60 * 1000;  // ... per 10 minutes
 const MAX_VIEWER_BUFFER = 4 * 1024 * 1024;
+const HEARTBEAT_MS = 30 * 1000;              // generous: mobile links stall for a while
+
+function iceServers() {
+  const list = [];
+  const stun = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  if (stun.length) list.push({ urls: stun });
+  if (process.env.TURN_URLS) {
+    list.push({
+      urls: process.env.TURN_URLS.split(',').map((s) => s.trim()).filter(Boolean),
+      username: process.env.TURN_USERNAME || '',
+      credential: process.env.TURN_CREDENTIAL || '',
+    });
+  }
+  return list;
+}
 
 /** code -> { code, secret, name, device, viewer, graceTimer } */
 const sessions = new Map();
-/** ip -> { count, resetAt } */
+/** key -> { count, resetAt } ; key is an IP or '*' for the global counter */
 const joinFailures = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -47,20 +79,19 @@ const MIME = {
   '.webmanifest': 'application/manifest+json',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
-  '.ico': 'image/x-icon',
 };
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  if (url.pathname === '/healthz') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, sessions: sessions.size }));
+function serveStatic(req, res) {
+  let rel;
+  try {
+    rel = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+  } catch {
+    res.writeHead(400).end();
     return;
   }
-  let rel = decodeURIComponent(url.pathname);
   if (rel === '/' || rel === '') rel = '/index.html';
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
-  if (!file.startsWith(PUBLIC_DIR)) {
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) {
     res.writeHead(403).end();
     return;
   }
@@ -73,18 +104,40 @@ const server = http.createServer((req, res) => {
       'content-type': MIME[path.extname(file)] || 'application/octet-stream',
       'cache-control': 'no-cache',
       'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
     });
     res.end(data);
   });
-});
+}
+
+function makeHttpHandler({ console: withConsole }) {
+  return (req, res) => {
+    const pathname = (req.url || '/').split('?')[0];
+    if (pathname === '/healthz') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (withConsole) return serveStatic(req, res);
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('Remote Help relay is running.\n');
+  };
+}
 
 // ---------------------------------------------------------------- helpers
 
 function clientIp(req) {
+  let ip = req.socket.remoteAddress || 'unknown';
   if (TRUST_PROXY && req.headers['x-forwarded-for']) {
-    return String(req.headers['x-forwarded-for']).split(',')[0].trim();
+    // The right-most entry is the one appended by our own (trusted) proxy;
+    // anything to the left is supplied by the client and can be forged.
+    const parts = String(req.headers['x-forwarded-for']).split(',').map((s) => s.trim()).filter(Boolean);
+    if (parts.length) ip = parts[parts.length - 1];
   }
-  return req.socket.remoteAddress || 'unknown';
+  ip = ip.replace(/^::ffff:/, '');
+  // Group IPv6 addresses by /64 — one client usually owns the whole prefix.
+  if (ip.includes(':')) ip = ip.split(':').slice(0, 4).join(':') + '::/64';
+  return ip;
 }
 
 function send(ws, obj) {
@@ -100,26 +153,32 @@ function newCode() {
 }
 
 function safeEqual(a, b) {
-  const ba = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function failures(key) {
+  const e = joinFailures.get(key);
+  if (!e) return 0;
+  if (Date.now() > e.resetAt) {
+    joinFailures.delete(key);
+    return 0;
+  }
+  return e.count;
 }
 
 function isRateLimited(ip) {
-  const e = joinFailures.get(ip);
-  if (!e) return false;
-  if (Date.now() > e.resetAt) {
-    joinFailures.delete(ip);
-    return false;
-  }
-  return e.count >= JOIN_FAIL_LIMIT;
+  return failures(ip) >= JOIN_FAIL_LIMIT_IP || failures('*') >= JOIN_FAIL_LIMIT_GLOBAL;
 }
 
 function recordJoinFailure(ip) {
   const now = Date.now();
-  const e = joinFailures.get(ip);
-  if (!e || now > e.resetAt) joinFailures.set(ip, { count: 1, resetAt: now + JOIN_FAIL_WINDOW_MS });
-  else e.count++;
+  for (const key of [ip, '*']) {
+    const e = joinFailures.get(key);
+    if (!e || now > e.resetAt) joinFailures.set(key, { count: 1, resetAt: now + JOIN_FAIL_WINDOW_MS });
+    else e.count++;
+  }
 }
 
 function endSession(s, reason) {
@@ -153,12 +212,15 @@ function handleDevice(ws) {
     if (session) {
       if (!isBinary) {
         const m = parse(data, false);
-        if (m && m.type === 'bye') { endSession(session, 'stopped'); return; }
+        if (m && m.type === 'bye') {
+          endSession(session, 'stopped');
+          return;
+        }
       }
       const v = session.viewer;
       if (!v || v.readyState !== WebSocket.OPEN) return;
       if (isBinary) {
-        if (v.bufferedAmount > MAX_VIEWER_BUFFER) return; // drop frame, helper is slow
+        if (v.bufferedAmount > MAX_VIEWER_BUFFER) return; // helper is slow; phone recovers via acks
         v.send(data, { binary: true });
       } else {
         v.send(data.toString());
@@ -180,10 +242,10 @@ function handleDevice(ws) {
         s.device = ws;
         s.name = name;
         session = s;
-        send(ws, { type: 'registered', code: s.code, secret: s.secret, resumed: true });
+        send(ws, { type: 'registered', code: s.code, secret: s.secret, resumed: true, iceServers: iceServers() });
         if (s.viewer) {
           send(s.viewer, { type: 'device-online', name });
-          send(ws, { type: 'viewer-joined' });
+          send(ws, { type: 'viewer-joined', resumed: true });
         }
         log(`device resumed ${s.code}`);
         return;
@@ -200,7 +262,7 @@ function handleDevice(ws) {
       graceTimer: null,
     };
     sessions.set(code, session);
-    send(ws, { type: 'registered', code, secret: session.secret, resumed: false });
+    send(ws, { type: 'registered', code, secret: session.secret, resumed: false, iceServers: iceServers() });
     log(`device registered ${code} (${name})`);
   });
 
@@ -208,6 +270,7 @@ function handleDevice(ws) {
     if (!session || session.device !== ws) return;
     const s = session;
     s.device = null;
+    if (!sessions.has(s.code)) return;
     if (s.viewer) send(s.viewer, { type: 'device-offline' });
     s.graceTimer = setTimeout(() => endSession(s, 'phone disconnected'), DEVICE_GRACE_MS);
   });
@@ -252,16 +315,18 @@ function handleViewer(ws, ip) {
       return;
     }
 
-    // Only one helper at a time: a new join replaces the previous tab.
-    if (s.viewer && s.viewer !== ws) {
+    // One helper at a time. A new join (e.g. the helper reloaded the page) replaces
+    // the old tab, and the phone owner is told about it.
+    const replaced = !!(s.viewer && s.viewer !== ws);
+    if (replaced) {
       send(s.viewer, { type: 'session-ended', reason: 'Підключились з іншого вікна' });
       s.viewer.close(1000, 'replaced');
     }
     s.viewer = ws;
     session = s;
-    send(ws, { type: 'joined', code: s.code, name: s.name, online: !!s.device, accessRequired: !!ACCESS_TOKEN });
-    if (s.device) send(s.device, { type: 'viewer-joined' });
-    log(`viewer joined ${s.code} from ${ip}`);
+    send(ws, { type: 'joined', code: s.code, name: s.name, online: !!s.device, iceServers: iceServers() });
+    if (s.device) send(s.device, { type: 'viewer-joined', replaced });
+    log(`viewer joined ${s.code} from ${ip}${replaced ? ' (replaced previous)' : ''}`);
   });
 
   ws.on('close', () => {
@@ -276,20 +341,24 @@ function handleViewer(ws, ip) {
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 
-server.on('upgrade', (req, socket, head) => {
-  const { pathname } = new URL(req.url, 'http://localhost');
-  if (pathname !== '/ws/device' && pathname !== '/ws/viewer') {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    ws.isAlive = true;
-    ws.on('pong', () => (ws.isAlive = true));
-    ws.on('error', () => {});
-    if (pathname === '/ws/device') handleDevice(ws);
-    else handleViewer(ws, clientIp(req));
+function attachUpgrade(server, { device, viewer }) {
+  server.on('upgrade', (req, socket, head) => {
+    const pathname = (req.url || '/').split('?')[0];
+    const isDevice = pathname === '/ws/device' && device;
+    const isViewer = pathname === '/ws/viewer' && viewer;
+    if (!isDevice && !isViewer) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.isAlive = true;
+      ws.on('pong', () => (ws.isAlive = true));
+      ws.on('error', () => {});
+      if (isDevice) handleDevice(ws);
+      else handleViewer(ws, clientIp(req));
+    });
   });
-});
+}
 
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
@@ -300,14 +369,34 @@ const heartbeat = setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   }
-}, 20000);
+}, HEARTBEAT_MS);
+heartbeat.unref();
 
-wss.on('close', () => clearInterval(heartbeat));
+// Public server. In laptop mode it only accepts phones.
+const server = http.createServer(makeHttpHandler({ console: !CONSOLE_PORT }));
+attachUpgrade(server, { device: true, viewer: !CONSOLE_PORT });
+
+// Local-only console server (laptop mode).
+const consoleServer = CONSOLE_PORT ? http.createServer(makeHttpHandler({ console: true })) : null;
+if (consoleServer) attachUpgrade(consoleServer, { device: true, viewer: true });
 
 if (require.main === module) {
-  server.listen(PORT, () => {
-    log(`Remote Help server on :${PORT}${ACCESS_TOKEN ? ' (access token required)' : ''}`);
-  });
+  if (!CONSOLE_PORT && !ACCESS_TOKEN && !ALLOW_INSECURE) {
+    console.error(
+      'Refusing to start: the helper console is public but ACCESS_TOKEN is not set.\n' +
+      '  • On a laptop use CONSOLE_PORT=8081 (console only on localhost), or\n' +
+      '  • set ACCESS_TOKEN=<long random string>, or\n' +
+      '  • ALLOW_INSECURE=1 for a quick local test.'
+    );
+    process.exit(1);
+  }
+  server.listen(PORT, () => log(`phones connect to :${PORT}${CONSOLE_PORT ? ' (phones only)' : ''}`));
+  if (consoleServer) {
+    consoleServer.listen(CONSOLE_PORT, '127.0.0.1', () =>
+      log(`helper console: http://localhost:${CONSOLE_PORT}  (local only)`));
+  } else {
+    log(`helper console: http://localhost:${PORT}${ACCESS_TOKEN ? ' (access token required)' : ''}`);
+  }
 }
 
-module.exports = { server, sessions };
+module.exports = { server, consoleServer, sessions };

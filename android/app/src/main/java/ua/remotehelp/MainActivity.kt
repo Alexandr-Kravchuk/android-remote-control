@@ -41,8 +41,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-    private val notificationPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { askScreenCapture() }
+    private val permissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+            if (res[Manifest.permission.RECORD_AUDIO] == false) {
+                Toast.makeText(this, R.string.mic_denied, Toast.LENGTH_LONG).show()
+            }
+            askScreenCapture()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -56,6 +61,9 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
         b.settingsBtn.setOnClickListener { showSettings() }
+        b.muteBtn.setOnClickListener {
+            ScreenShareService.setMuted(this, !SessionState.state.value.muted)
+        }
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -88,6 +96,20 @@ class MainActivity : AppCompatActivity() {
         b.codeText.text = formatCode(s.code)
         b.hintText.visibility = if (s.phase == Phase.WAITING) View.VISIBLE else View.GONE
         b.hintText.setText(R.string.tell_code)
+
+        val inCall = !idle && s.call != SessionState.Call.NONE
+        b.callCard.visibility = if (inCall) View.VISIBLE else View.GONE
+        b.callText.setText(
+            when (s.call) {
+                SessionState.Call.CONNECTING -> R.string.call_connecting
+                SessionState.Call.ACTIVE -> if (s.muted) R.string.call_active_muted else R.string.call_active
+                SessionState.Call.RECONNECTING -> R.string.call_reconnecting
+                SessionState.Call.FAILED -> R.string.call_failed
+                SessionState.Call.NONE -> R.string.call_connecting
+            }
+        )
+        b.muteBtn.setText(if (s.muted) R.string.mic_unmute else R.string.mic_mute)
+        b.muteBtn.visibility = if (s.call == SessionState.Call.FAILED) View.GONE else View.VISIBLE
     }
 
     private fun startHelp() {
@@ -96,13 +118,11 @@ class MainActivity : AppCompatActivity() {
             showSettings()
             return
         }
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            askScreenCapture()
-        }
+        val wanted = buildList {
+            add(Manifest.permission.RECORD_AUDIO)                       // voice call with the helper
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+        }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        if (wanted.isNotEmpty()) permissions.launch(wanted.toTypedArray()) else askScreenCapture()
     }
 
     private fun askScreenCapture() {

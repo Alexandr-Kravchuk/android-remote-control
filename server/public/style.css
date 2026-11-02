@@ -136,3 +136,16 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
   .screen-box { min-height: 60vh; }
   .panel { width: 100%; }
 }
+
+/* ---------- link quality & call ---------- */
+.link { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; }
+.bars i { width: 4px; background: var(--border); border-radius: 1px; }
+.bars i:nth-child(1) { height: 5px; } .bars i:nth-child(2) { height: 9px; } .bars i:nth-child(3) { height: 14px; }
+.link.good .bars i { background: var(--ok); }
+.link.fair .bars i:nth-child(-n+2) { background: var(--warn); }
+.link.poor .bars i:nth-child(1) { background: var(--danger); }
+.call { display: grid; gap: 8px; }
+.call .hint { margin: 0; }
+#callBtn.active { background: var(--surface); color: var(--danger); border-color: var(--danger); }
+#micBtn.off { color: var(--danger); border-color: var(--danger); }

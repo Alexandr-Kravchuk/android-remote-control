@@ -1,5 +1,6 @@
 package ua.remotehelp
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,12 +8,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.BatteryManager
@@ -21,12 +19,12 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -34,19 +32,18 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString.Companion.toByteString
+import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
+import org.webrtc.PeerConnection
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.max
 import kotlin.math.min
 
 /**
  * Foreground service that owns a help session:
- *  - captures the screen via MediaProjection,
- *  - streams JPEG frames to the relay server over a WebSocket,
- *  - receives the helper's commands and hands them to [ControlService].
+ *  - keeps a WebSocket to the relay server (reconnects and resumes the same code),
+ *  - streams the screen via [ScreenStreamer] while a helper is watching,
+ *  - executes the helper's commands through [ControlService],
+ *  - runs the voice call ([VoiceCall]) when the helper starts one.
  */
 class ScreenShareService : Service() {
 
@@ -54,11 +51,12 @@ class ScreenShareService : Service() {
         private const val TAG = "RemoteHelp"
         private const val ACTION_START = "ua.remotehelp.START"
         private const val ACTION_STOP = "ua.remotehelp.STOP"
+        private const val ACTION_MUTE = "ua.remotehelp.MUTE"
         private const val EXTRA_RESULT_CODE = "resultCode"
         private const val EXTRA_DATA = "data"
+        private const val EXTRA_MUTED = "muted"
         private const val CHANNEL = "session"
         private const val NOTIF_ID = 1
-        private const val MAX_IN_FLIGHT = 2
 
         fun start(ctx: Context, resultCode: Int, data: Intent) {
             val i = Intent(ctx, ScreenShareService::class.java)
@@ -71,45 +69,36 @@ class ScreenShareService : Service() {
         fun stop(ctx: Context) {
             ctx.startService(Intent(ctx, ScreenShareService::class.java).setAction(ACTION_STOP))
         }
-    }
 
-    /** Capture profile chosen by the helper. */
-    private enum class Quality(val maxSide: Int, val jpeg: Int, val frameIntervalMs: Long) {
-        LOW(960, 40, 250), MEDIUM(1280, 60, 120), HIGH(1920, 80, 70)
+        fun setMuted(ctx: Context, muted: Boolean) {
+            ctx.startService(
+                Intent(ctx, ScreenShareService::class.java).setAction(ACTION_MUTE).putExtra(EXTRA_MUTED, muted)
+            )
+        }
     }
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var worker: HandlerThread
     private lateinit var capture: Handler
 
-    // --- capture state (touched only on the capture thread) ---
     private var projection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var reader: ImageReader? = null
-    private var frame: Bitmap? = null
-    private var packed: ByteBuffer? = null
-    private var dirty = false
-    private var lastSendAt = 0L
-    private var quality = Quality.MEDIUM
-    private var lastScreenW = 0
-    private var lastScreenH = 0
-    private val jpegOut = ByteArrayOutputStream(256 * 1024)
+    private var streamer: ScreenStreamer? = null   // touched on the capture thread
+    private var preset = ScreenStreamer.Preset.AUTO
+    private var voice: VoiceCall? = null
+    private var iceServers: JSONArray? = null
 
-    // --- network state ---
     private val http = OkHttpClient.Builder()
-        .pingInterval(15, TimeUnit.SECONDS)
-        .connectTimeout(15, TimeUnit.SECONDS)
+        .pingInterval(10, TimeUnit.SECONDS)      // notice dead mobile links quickly
+        .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
     @Volatile private var socket: WebSocket? = null
     @Volatile private var viewerConnected = false
     @Volatile private var stopping = false
-    private val inFlight = AtomicInteger(0)
     private var code: String? = null
     private var secret: String? = null
     private var reconnectDelayMs = 1000L
 
-    private val sendRunnable = Runnable { maybeSendFrame() }
     private val infoRunnable = object : Runnable {
         override fun run() {
             if (viewerConnected) sendInfo()
@@ -121,9 +110,7 @@ class ScreenShareService : Service() {
         override fun onDisplayAdded(displayId: Int) = Unit
         override fun onDisplayRemoved(displayId: Int) = Unit
         override fun onDisplayChanged(displayId: Int) {
-            if (displayId != Display.DEFAULT_DISPLAY) return
-            val s = realScreenSize(this@ScreenShareService)
-            if (s.x != lastScreenW || s.y != lastScreenH) setupCapture()   // rotated
+            if (displayId == Display.DEFAULT_DISPLAY) streamer?.onDisplayChanged()   // rotation
         }
     }
 
@@ -136,48 +123,60 @@ class ScreenShareService : Service() {
         createChannel()
     }
 
+    private fun hasMic() =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_STOP -> {
-                stopSession()
-                return START_NOT_STICKY
+            ACTION_STOP -> stopSession()
+            ACTION_MUTE -> {
+                if (projection == null) { stopSelf(); return START_NOT_STICKY }
+                val m = intent.getBooleanExtra(EXTRA_MUTED, false)
+                voice?.setMuted(m)
+                SessionState.update { it.copy(muted = m) }
+                updateNotification()
             }
-            ACTION_START -> {
-                if (projection != null) return START_NOT_STICKY
-                // Must be in the foreground with type mediaProjection before obtaining the projection.
-                ServiceCompat.startForeground(
-                    this, NOTIF_ID, buildNotification(),
-                    if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0
-                )
-                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-                val data = IntentCompat.getParcelableExtra(intent, EXTRA_DATA, Intent::class.java)
-                if (data == null) {
-                    stopSession(); return START_NOT_STICKY
-                }
-                val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                val mp = try {
-                    mpm.getMediaProjection(resultCode, data)
-                } catch (e: Exception) {
-                    Log.e(TAG, "getMediaProjection failed", e); null
-                }
-                if (mp == null) {
-                    stopSession(); return START_NOT_STICKY
-                }
-                mp.registerCallback(object : MediaProjection.Callback() {
-                    override fun onStop() {
-                        main.post { stopSession() }     // user tapped "Stop sharing" in the status bar
-                    }
-                }, main)
-                projection = mp
-                stopping = false
-                SessionState.set(SessionState.State(SessionState.Phase.CONNECTING))
-                (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, capture)
-                capture.post { setupCapture() }
-                connect()
-                main.postDelayed(infoRunnable, 60_000)
-            }
+            ACTION_START -> startSession(intent)
         }
         return START_NOT_STICKY
+    }
+
+    private fun startSession(intent: Intent) {
+        if (projection != null) return
+        // Must already be in the foreground (type mediaProjection) before obtaining the projection.
+        var types = 0
+        if (Build.VERSION.SDK_INT >= 29) types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        if (Build.VERSION.SDK_INT >= 30 && hasMic()) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), types)
+
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+        val data = IntentCompat.getParcelableExtra(intent, EXTRA_DATA, Intent::class.java)
+        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val mp = try {
+            data?.let { mpm.getMediaProjection(resultCode, it) }
+        } catch (e: Exception) {
+            Log.e(TAG, "getMediaProjection failed", e); null
+        }
+        if (mp == null) {
+            stopSession(); return
+        }
+        mp.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                main.post { stopSession() }     // "Stop sharing" from the status bar
+            }
+        }, main)
+        projection = mp
+        stopping = false
+        streamer = ScreenStreamer(
+            this, mp, capture,
+            sendBinary = { bytes -> socket?.send(bytes.toByteString()) ?: false },
+            sendJson = { sendJson(it) },
+            queuedBytes = { socket?.queueSize() ?: 0L },
+        )
+        SessionState.set(SessionState.State(SessionState.Phase.CONNECTING))
+        (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, capture)
+        connect()
+        main.postDelayed(infoRunnable, 60_000)
     }
 
     override fun onDestroy() {
@@ -186,117 +185,13 @@ class ScreenShareService : Service() {
         super.onDestroy()
     }
 
-    // ------------------------------------------------------------------ capture
-
-    private fun setupCapture() {
-        if (Looper.myLooper() != worker.looper) { capture.post { setupCapture() }; return }
-        val mp = projection ?: return
-        val real = realScreenSize(this)
-        lastScreenW = real.x
-        lastScreenH = real.y
-        val scale = min(1.0, quality.maxSide.toDouble() / max(real.x, real.y))
-        val w = ((real.x * scale).toInt() / 2) * 2
-        val h = ((real.y * scale).toInt() / 2) * 2
-        val dpi = max(120, (realDensityDpi(this) * scale).toInt())
-
-        val newReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-        newReader.setOnImageAvailableListener({ r -> onImage(r) }, capture)
-        val vd = virtualDisplay
-        try {
-            if (vd == null) {
-                virtualDisplay = mp.createVirtualDisplay(
-                    "RemoteHelp", w, h, dpi,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    newReader.surface, null, capture
-                )
-            } else {
-                vd.resize(w, h, dpi)
-                vd.surface = newReader.surface
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "virtual display failed", e)
-            newReader.close()
-            main.post { stopSession() }
-            return
-        }
-        reader?.close()
-        reader = newReader
-        frame = null
-        packed = null
-        sendJson(JSONObject().put("type", "screen").put("width", real.x).put("height", real.y))
-    }
-
-    private fun onImage(r: ImageReader) {
-        if (r !== reader) return
-        val img = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return
-        try {
-            val plane = img.planes[0]
-            val w = img.width
-            val h = img.height
-            val rowBytes = w * 4
-            val bmp = frame?.takeIf { it.width == w && it.height == h }
-                ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { frame = it }
-            val src = plane.buffer
-            if (plane.rowStride == rowBytes && plane.pixelStride == 4) {
-                src.rewind()
-                bmp.copyPixelsFromBuffer(src)
-            } else {
-                // Rows are padded: repack them tightly.
-                val dst = packed?.takeIf { it.capacity() == rowBytes * h }
-                    ?: ByteBuffer.allocateDirect(rowBytes * h).also { packed = it }
-                dst.clear()
-                for (row in 0 until h) {
-                    val start = row * plane.rowStride
-                    src.limit(min(src.capacity(), start + rowBytes))
-                    src.position(start)
-                    dst.put(src)
-                }
-                dst.rewind()
-                bmp.copyPixelsFromBuffer(dst)
-            }
-            dirty = true
-        } catch (e: Exception) {
-            Log.w(TAG, "frame copy failed", e)
-        } finally {
-            img.close()
-        }
-        maybeSendFrame()
-    }
-
-    private fun scheduleSend(delayMs: Long) {
-        capture.removeCallbacks(sendRunnable)
-        capture.postDelayed(sendRunnable, max(1, delayMs))
-    }
-
-    /** Sends the latest frame if the helper is watching and the pipe isn't full. */
-    private fun maybeSendFrame() {
-        val ws = socket ?: return
-        val bmp = frame ?: return
-        if (!viewerConnected || !dirty) return
-        val now = SystemClock.uptimeMillis()
-        if (inFlight.get() >= MAX_IN_FLIGHT) {
-            if (now - lastSendAt > 3000) inFlight.set(0) // lost acks — recover
-            else { scheduleSend(100); return }
-        }
-        val wait = lastSendAt + quality.frameIntervalMs - now
-        if (wait > 0) { scheduleSend(wait); return }
-        if (ws.queueSize() > 1_000_000) { scheduleSend(100); return }
-
-        dirty = false
-        jpegOut.reset()
-        bmp.compress(Bitmap.CompressFormat.JPEG, quality.jpeg, jpegOut)
-        if (ws.send(jpegOut.toByteArray().toByteString())) {
-            inFlight.incrementAndGet()
-            lastSendAt = now
-        }
-    }
-
     // ------------------------------------------------------------------ network
 
     private fun connect() {
         if (stopping) return
-        val url = try { Prefs.deviceSocketUrl(this) } catch (_: Exception) { null }
-        val req = try { Request.Builder().url(url ?: "").build() } catch (e: Exception) {
+        val req = try {
+            Request.Builder().url(Prefs.deviceSocketUrl(this)).build()
+        } catch (e: Exception) {
             SessionState.set(SessionState.State(SessionState.Phase.IDLE, error = getString(R.string.server_not_set)))
             stopSession(); return
         }
@@ -305,20 +200,20 @@ class ScreenShareService : Service() {
 
     private fun scheduleReconnect() {
         if (stopping) return
+        socket = null
         viewerConnected = false
+        capture.post { streamer?.pause() }
         SessionState.update { it.copy(phase = SessionState.Phase.RECONNECTING) }
         updateNotification()
         main.postDelayed({ connect() }, reconnectDelayMs)
-        reconnectDelayMs = min(15_000, reconnectDelayMs * 2)
+        reconnectDelayMs = min(10_000, reconnectDelayMs * 2)
     }
 
     private inner class Listener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             if (webSocket !== socket) return
             reconnectDelayMs = 1000
-            val hello = JSONObject()
-                .put("type", "hello")
-                .put("name", deviceName())
+            val hello = JSONObject().put("type", "hello").put("name", deviceName())
             code?.let { hello.put("code", it) }
             secret?.let { hello.put("secret", it) }
             webSocket.send(hello.toString())
@@ -331,12 +226,12 @@ class ScreenShareService : Service() {
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (webSocket === socket) main.post { scheduleReconnect() }
+            main.post { if (webSocket === socket) scheduleReconnect() }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.w(TAG, "socket failure: ${t.message}")
-            if (webSocket === socket) main.post { scheduleReconnect() }
+            main.post { if (webSocket === socket) scheduleReconnect() }
         }
     }
 
@@ -351,6 +246,7 @@ class ScreenShareService : Service() {
             "registered" -> {
                 code = msg.optString("code")
                 secret = msg.optString("secret")
+                msg.optJSONArray("iceServers")?.let { iceServers = it }
                 main.post {
                     SessionState.update {
                         it.copy(
@@ -360,50 +256,97 @@ class ScreenShareService : Service() {
                     }
                     updateNotification()
                 }
-                capture.post {
-                    if (lastScreenW > 0) sendJson(
-                        JSONObject().put("type", "screen").put("width", lastScreenW).put("height", lastScreenH)
-                    )
-                }
             }
             "viewer-joined" -> {
                 viewerConnected = true
-                inFlight.set(0)
-                capture.post { dirty = true; lastSendAt = 0; maybeSendFrame() }
                 sendInfo()
                 sendJson(JSONObject().put("type", "a11y").put("enabled", ControlService.instance != null))
+                sendJson(JSONObject().put("type", "voice-available").put("available", hasMic()))
+                voice?.let { v ->
+                    sendJson(JSONObject().put("type", "call-state").put("state", v.state.name.lowercase()).put("muted", v.muted))
+                }
+                val resumed = msg.optBoolean("resumed")
                 main.post {
                     SessionState.update { it.copy(phase = SessionState.Phase.CONNECTED) }
                     updateNotification()
-                    Toast.makeText(this, R.string.toast_helper_joined, Toast.LENGTH_LONG).show()
+                    if (!resumed) Toast.makeText(this, R.string.toast_helper_joined, Toast.LENGTH_LONG).show()
                 }
+                // Streaming starts when the helper tells us which formats it can decode ("caps").
+            }
+            "caps" -> {
+                val mode = if (msg.optBoolean("h264")) ScreenStreamer.Mode.H264 else ScreenStreamer.Mode.JPEG
+                capture.post { streamer?.start(mode, preset) }
             }
             "viewer-left" -> {
                 viewerConnected = false
+                capture.post { streamer?.pause() }
                 main.post {
+                    endCall()
                     SessionState.update { it.copy(phase = SessionState.Phase.WAITING) }
                     updateNotification()
                     Toast.makeText(this, R.string.toast_helper_left, Toast.LENGTH_SHORT).show()
                 }
             }
             "ack" -> {
-                if (inFlight.decrementAndGet() < 0) inFlight.set(0)
-                capture.post(sendRunnable)
+                val id = msg.optInt("id", -1)
+                capture.post { streamer?.onAck(id) }
             }
+            "keyframe" -> capture.post { streamer?.requestKeyFrame() }
             "quality" -> {
-                val q = when (msg.optString("level")) {
-                    "low" -> Quality.LOW
-                    "high" -> Quality.HIGH
-                    else -> Quality.MEDIUM
+                val p = when (msg.optString("level")) {
+                    "low" -> ScreenStreamer.Preset.LOW
+                    "high" -> ScreenStreamer.Preset.HIGH
+                    else -> ScreenStreamer.Preset.AUTO
                 }
-                capture.post {
-                    if (q != quality) { quality = q; setupCapture() }
-                }
+                capture.post { preset = p; streamer?.setPreset(p) }
             }
+            "rtc-offer" -> main.post { onOffer(msg.optString("sdp")) }
+            // Same thread as "rtc-offer", so candidates never overtake the offer that creates the call.
+            "rtc-ice" -> main.post {
+                voice?.handleIce(msg.optString("candidate"), msg.optString("sdpMid").ifEmpty { null }, msg.optInt("sdpMLineIndex"))
+            }
+            "call-end" -> main.post { endCall() }
             "stop" -> main.post { stopSession() }
             else -> main.post { handleControl(msg) }
         }
     }
+
+    // ------------------------------------------------------------------ voice
+
+    private fun onOffer(sdp: String) {
+        if (!hasMic()) {
+            sendJson(JSONObject().put("type", "call-unavailable").put("reason", "no-permission"))
+            return
+        }
+        val v = voice ?: VoiceCall(this, ::sendJson) { st -> main.post { onCallState(st) } }.also {
+            voice = it
+            it.setMuted(SessionState.state.value.muted)
+            Toast.makeText(this, R.string.toast_call_started, Toast.LENGTH_LONG).show()
+        }
+        val servers: List<PeerConnection.IceServer> = VoiceCall.parseIceServers(iceServers)
+        v.handleOffer(sdp, servers)
+    }
+
+    private fun onCallState(st: VoiceCall.State) {
+        val ui = when (st) {
+            VoiceCall.State.CONNECTING -> SessionState.Call.CONNECTING
+            VoiceCall.State.CONNECTED -> SessionState.Call.ACTIVE
+            VoiceCall.State.RECONNECTING -> SessionState.Call.RECONNECTING
+            VoiceCall.State.FAILED -> SessionState.Call.FAILED
+            VoiceCall.State.ENDED -> SessionState.Call.NONE
+        }
+        SessionState.update { it.copy(call = ui) }
+        updateNotification()
+    }
+
+    private fun endCall() {
+        voice?.close()
+        voice = null
+        SessionState.update { it.copy(call = SessionState.Call.NONE) }
+        updateNotification()
+    }
+
+    // ------------------------------------------------------------------ control
 
     /** Helper's input commands — executed on the main thread via the accessibility service. */
     private fun handleControl(msg: JSONObject) {
@@ -416,7 +359,9 @@ class ScreenShareService : Service() {
         }
         val svc = ControlService.instance
         if (svc == null) {
-            notice("Керування вимкнено на телефоні (Спеціальні можливості → «Допомога — керування»)")
+            if (type in setOf("tap", "longpress", "swipe", "scroll", "global", "text", "key")) {
+                notice("Керування вимкнено на телефоні (Спеціальні можливості → «Допомога — керування»)")
+            }
             return
         }
         when (type) {
@@ -465,6 +410,9 @@ class ScreenShareService : Service() {
         viewerConnected = false
         main.removeCallbacksAndMessages(null)
 
+        voice?.close(notify = false)
+        voice = null
+
         socket?.let {
             it.send(JSONObject().put("type", "bye").toString())
             it.close(1000, "stopped")
@@ -479,11 +427,9 @@ class ScreenShareService : Service() {
         }
         val mp = projection
         projection = null
-        capture.post {
-            virtualDisplay?.release(); virtualDisplay = null
-            reader?.close(); reader = null
-            frame = null; packed = null
-        }
+        val s = streamer
+        streamer = null
+        capture.post { s?.release() }
         try { mp?.stop() } catch (_: Exception) {}
 
         SessionState.update { SessionState.State(SessionState.Phase.IDLE, error = it.error) }
@@ -512,12 +458,14 @@ class ScreenShareService : Service() {
         )
         val st = SessionState.state.value
         val title = when (st.phase) {
-            SessionState.Phase.CONNECTED -> getString(R.string.notif_title_connected)
+            SessionState.Phase.CONNECTED ->
+                if (st.call == SessionState.Call.ACTIVE) getString(R.string.notif_title_call)
+                else getString(R.string.notif_title_connected)
             SessionState.Phase.WAITING -> getString(R.string.notif_title_waiting, formatCode(st.code))
             SessionState.Phase.RECONNECTING -> getString(R.string.reconnecting)
             else -> getString(R.string.connecting)
         }
-        return NotificationCompat.Builder(this, CHANNEL)
+        val b = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(getString(R.string.notif_text))
@@ -525,7 +473,15 @@ class ScreenShareService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(0, getString(R.string.notif_stop), stop)
-            .build()
+        if (st.call != SessionState.Call.NONE) {
+            val mute = PendingIntent.getService(
+                this, 2,
+                Intent(this, ScreenShareService::class.java).setAction(ACTION_MUTE).putExtra(EXTRA_MUTED, !st.muted),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            b.addAction(0, getString(if (st.muted) R.string.mic_unmute else R.string.mic_mute), mute)
+        }
+        return b.build()
     }
 
     private fun updateNotification() {

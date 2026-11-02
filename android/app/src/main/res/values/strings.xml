@@ -34,4 +34,15 @@
     <string name="toast_stopped">Допомогу завершено</string>
     <string name="msg_from_helper">Повідомлення від помічника</string>
     <string name="ok">Зрозуміло</string>
+
+    <string name="toast_call_started">Помічник розпочав розмову — говоріть</string>
+    <string name="notif_title_call">Розмова з помічником</string>
+    <string name="mic_mute">Вимкнути мікрофон</string>
+    <string name="mic_unmute">Увімкнути мікрофон</string>
+    <string name="call_connecting">📞 З’єднуємо розмову…</string>
+    <string name="call_active">📞 Розмова йде — говоріть, вас чути</string>
+    <string name="call_active_muted">📞 Розмова йде — ваш мікрофон вимкнено</string>
+    <string name="call_reconnecting">📞 Поганий зв’язок, відновлюємо розмову…</string>
+    <string name="call_failed">📞 Розмову не вдалося з’єднати. Помічник може подзвонити вам звичайним дзвінком.</string>
+    <string name="mic_denied">Без доступу до мікрофона розмова в додатку не працюватиме, але помічник може вам подзвонити.</string>
 </resources>

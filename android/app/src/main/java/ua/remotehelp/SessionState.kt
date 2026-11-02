@@ -7,11 +7,14 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Shared state between [ScreenShareService] and [MainActivity]. */
 object SessionState {
     enum class Phase { IDLE, CONNECTING, WAITING, CONNECTED, RECONNECTING }
+    enum class Call { NONE, CONNECTING, ACTIVE, RECONNECTING, FAILED }
 
     data class State(
         val phase: Phase = Phase.IDLE,
         val code: String? = null,
         val error: String? = null,
+        val call: Call = Call.NONE,
+        val muted: Boolean = false,
     )
 
     private val _state = MutableStateFlow(State())
